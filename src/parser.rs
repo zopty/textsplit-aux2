@@ -22,22 +22,39 @@ pub struct TextElement {
     pub is_italic: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_index: Option<usize>,
     pub text: String,
 }
 
+#[allow(dead_code)]
 impl TextElement {
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(&self)
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct Style {
     size: Option<f32>,
     font: Option<String>,
     is_bold: Option<bool>,
     is_italic: Option<bool>,
     color: Option<String>,
+    line_index: usize,
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Style {
+            size: None,
+            font: None,
+            is_bold: None,
+            is_italic: None,
+            color: None,
+            line_index: 0,
+        }
+    }
 }
 
 enum Action<'a> {
@@ -51,7 +68,7 @@ enum Action<'a> {
     ResetStyle,
     UpdateColor(String),
     ResetColor,
-    AppendText(&'a str),
+    AppendText(&'a str, usize),
 }
 
 fn parse_optional_param(
@@ -110,28 +127,33 @@ fn parse_color(input: &str) -> IResult<&str, String> {
     .parse(input)
 }
 
-fn parse_text_until_tag(input: &str) -> IResult<&str, &str> {
+fn take_until_any<'a>(patterns: &[&'static str]) -> impl Fn(&'a str) -> IResult<&'a str, &'a str> {
+    move |input: &'a str| {
+        let mut min_pos = input.len();
+        for pattern in patterns {
+            if let Some(pos) = input.find(pattern) {
+                min_pos = min_pos.min(pos);
+            }
+        }
+        let (text, rest) = input.split_at(min_pos);
+        Ok((rest, text))
+    }
+}
+
+fn parse_newline(input: &str) -> IResult<&str, (&str, usize)> {
+    map(tag("\n"), |s: &str| (s, 1)).parse(input)
+}
+
+fn parse_text_greedy(input: &str) -> IResult<&str, &str> {
     if input.is_empty() {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
             nom::error::ErrorKind::Eof,
         )));
     }
-    let s_pos = input.find("<s").unwrap_or(input.len());
-    let color_open_pos = input
-        .find("<#")
-        .map(|i| {
-            if input[i..].starts_with("<#>") {
-                input.len()
-            } else {
-                i
-            }
-        })
-        .unwrap_or(input.len());
-    let color_close_pos = input.find("<#>").unwrap_or(input.len());
 
-    let pos = s_pos.min(color_open_pos).min(color_close_pos);
-    let (text, rest) = input.split_at(pos);
+    // This parser takes all characters until it finds "<s", "<#", "<#>" or "\n"
+    let (rest, text) = take_until_any(&["<s", "<#", "<#>", "\n"])(input)?;
     Ok((rest, text))
 }
 
@@ -141,7 +163,8 @@ fn parse_action(input: &'_ str) -> IResult<&'_ str, Action<'_>> {
         map(tag("<s>"), |_| Action::ResetStyle),
         map(parse_color, Action::UpdateColor),
         map(tag("<#>"), |_| Action::ResetColor),
-        map(parse_text_until_tag, |s| Action::AppendText(s)),
+        map(parse_newline, |(s, c)| Action::AppendText(s, c)),
+        map(parse_text_greedy, |s| Action::AppendText(s, 0)),
     ))
     .parse(input)
 }
@@ -181,7 +204,7 @@ pub fn parse_markup(input: &str) -> Result<Vec<TextElement>, String> {
                 Action::ResetColor => {
                     style.color = None;
                 }
-                Action::AppendText(text) => {
+                Action::AppendText(text, newline_count) => {
                     if !text.is_empty() {
                         elements.push(TextElement {
                             size: style.size,
@@ -189,8 +212,10 @@ pub fn parse_markup(input: &str) -> Result<Vec<TextElement>, String> {
                             is_bold: style.is_bold,
                             is_italic: style.is_italic,
                             color: style.color.clone(),
+                            line_index: Some(style.line_index),
                             text: text.to_string(),
                         });
+                        style.line_index += newline_count;
                     }
                 }
             }
@@ -312,5 +337,53 @@ mod test {
 
         assert_eq!(result[2].size, None);
         assert_eq!(result[2].font, None);
+    }
+
+    #[test]
+    fn test_line_index_collection() {
+        let input = "Line 0\nLine 1<#ff0000>Red Line 1\nLine 2<s>Reset Line 2";
+        let result = parse_markup(input).unwrap();
+        println!("{:?}", result);
+        assert_eq!(result.len(), 7, "Expected 7 elements, got {}", result.len());
+
+        // Element 0: "Line 0"
+        assert_eq!(result[0].text, "Line 0");
+        assert_eq!(result[0].line_index, Some(0));
+        assert_eq!(result[0].color, None);
+
+        // Element 1: "\n"
+        assert_eq!(result[1].text, "\n");
+        assert_eq!(result[1].line_index, Some(0));
+        assert_eq!(result[1].color, None);
+
+        // Element 2: "Line 1"
+        assert_eq!(result[2].text, "Line 1");
+        assert_eq!(result[2].line_index, Some(1));
+        assert_eq!(result[2].color, None);
+
+        // Element 3: "Red Line 1" (color applied before this text)
+        assert_eq!(result[3].text, "Red Line 1");
+        assert_eq!(result[3].line_index, Some(1));
+        assert_eq!(result[3].color, Some("ff0000".to_string()));
+
+        // Element 4: "\n" (color carry-over)
+        assert_eq!(result[4].text, "\n");
+        assert_eq!(result[4].line_index, Some(1));
+        assert_eq!(result[4].color, Some("ff0000".to_string()));
+
+        // Element 5: "Line 2" (color carry-over)
+        assert_eq!(result[5].text, "Line 2");
+        assert_eq!(result[5].line_index, Some(2));
+        assert_eq!(result[5].color, Some("ff0000".to_string()));
+        assert_eq!(result[5].size, None); // No size explicitly set yet
+
+        // Element 6: "Reset Line 2" (style reset by <s>)
+        assert_eq!(result[6].text, "Reset Line 2");
+        assert_eq!(result[6].line_index, Some(2));
+        assert_eq!(result[6].color, Some("ff0000".to_string())); // Color reset by <s>
+        assert_eq!(result[6].size, None); // Size reset by <s>
+
+        // The input string has no further text after "Reset Line 2".
+        // The last element is "Reset Line 2".
     }
 }
